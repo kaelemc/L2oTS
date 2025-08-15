@@ -1,4 +1,4 @@
-name: Multiarch build
+name: Multiarch build (sequential)
 
 on:
   push:
@@ -9,29 +9,27 @@ on:
 
 permissions:
   contents: read
-  packages: write
+  packages: write   # needed for ghcr.io with GITHUB_TOKEN
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-arch:
-    strategy:
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-            platform: linux/amd64
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            platform: linux/arm64
-    runs-on: ${{ matrix.runner }}
+  build:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 1 }
 
-      - uses: docker/setup-buildx-action@v3
+      # QEMU only needed for arm64 build on x86 runner
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Extract metadata (tags & labels)
         id: meta
@@ -40,6 +38,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
+            type=ref,event=tag
             type=semver,pattern={{version}}
             type=raw,value=dev,enable={{is_default_branch}}
             type=raw,value=latest,enable={{is_default_branch}}
@@ -52,89 +51,106 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # PRs: build only (no push)
-      - name: Build (no push on PR)
+      # --- PRs: build only, no push ---
+
+      - name: Build amd64 (no push on PR)
         if: github.event_name == 'pull_request'
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: ${{ matrix.platform }}
+          platforms: linux/amd64
           push: false
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }}
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-amd64
           cache-to: type=gha,mode=max
           labels: ${{ steps.meta.outputs.labels }}
 
-      # Branch/tag pushes: push by digest
-      - name: Build and push by digest
-        id: build
+      - name: Build arm64 (no push on PR)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/arm64
+          push: false
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-arm64
+          cache-to: type=gha,mode=max
+          labels: ${{ steps.meta.outputs.labels }}
+
+      # --- Push path (sequential) ---
+
+      - name: Build & push amd64 by digest
+        id: build_amd64
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: ${{ matrix.platform }}
+          platforms: linux/amd64
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }}
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }},mode=max
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-amd64
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-amd64,mode=max
           provenance: false
           sbom: false
           labels: ${{ steps.meta.outputs.labels }}
 
-      - name: Export digest
+      - name: Ensure amd64 digest is visible
         if: github.event_name != 'pull_request'
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-      - uses: actions/upload-artifact@v4
-        if: github.event_name != 'pull_request'
-        with:
-          name: digests-${{ matrix.arch }}
-          path: /tmp/digests/*
-
-  merge:
-    needs: [build-arch]
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with: { name: digests-amd64, path: /tmp/digests }
-      - uses: actions/download-artifact@v4
-        with: { name: digests-arm64, path: /tmp/digests }
-
-      - name: Extract metadata (tags)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=raw,value=dev,enable={{is_default_branch}}
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create and push multi-arch manifest
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          TAGS: ${{ steps.meta.outputs.tags }}   # multi-line
+          DIGEST: ${{ steps.build_amd64.outputs.digest }}
         run: |
           set -euo pipefail
-          # Turn multiline $TAGS into an array safely
-          readarray -t TAG_ARR <<< "$TAGS"
-
-          # Build the digest list once
-          digests=()
-          for d in /tmp/digests/*; do
-            digests+=("$IMAGE@sha256:$(basename "$d")")
+          for i in {1..30}; do
+            if docker buildx imagetools inspect "$IMAGE@$DIGEST" >/dev/null 2>&1; then
+              echo "amd64 available: $IMAGE@$DIGEST"; exit 0; fi
+            sleep 3
           done
+          echo "amd64 digest not visible"; exit 1
 
-          # Create a manifest per tag
-          for t in "${TAG_ARR[@]}"; do
-            docker buildx imagetools create -t "$t" "${digests[@]}"
+      - name: Build & push arm64 by digest
+        id: build_arm64
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/arm64
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-arm64
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-arm64,mode=max
+          provenance: false
+          sbom: false
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Ensure arm64 digest is visible
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.build_arm64.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for i in {1..30}; do
+            if docker buildx imagetools inspect "$IMAGE@$DIGEST" >/dev/null 2>&1; then
+              echo "arm64 available: $IMAGE@$DIGEST"; exit 0; fi
+            sleep 3
           done
+          echo "arm64 digest not visible"; exit 1
 
+      - name: Create & push multi-arch manifest (sequential tags)
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          AMD64_DIGEST: ${{ steps.build_amd64.outputs.digest }}
+          ARM64_DIGEST: ${{ steps.build_arm64.outputs.digest }}
+        run: |
+          set -euo pipefail
+          readarray -t TAGS_ARR <<< "$TAGS"
+          for t in "${TAGS_ARR[@]}"; do
+            echo "Creating $t from:"
+            echo " - $IMAGE@$AMD64_DIGEST"
+            echo " - $IMAGE@$ARM64_DIGEST"
+            docker buildx imagetools create \
+              -t "$t" \
+              "$IMAGE@$AMD64_DIGEST" \
+              "$IMAGE@$ARM64_DIGEST"
+          done
