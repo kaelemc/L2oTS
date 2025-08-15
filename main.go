@@ -3,14 +3,16 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/signal"
 	"regexp"
 	"strconv"
 	"syscall"
+	"time"
 
-	"github.com/charmbracelet/log"
+	charmlog "github.com/charmbracelet/log"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/vishvananda/netlink"
@@ -19,7 +21,7 @@ import (
 )
 
 var (
-	logger     *log.Logger
+	logger     *charmlog.Logger
 	tsConn     net.PacketConn
 	peer       *net.UDPAddr
 	interfaces []*IFaceL2
@@ -215,16 +217,6 @@ func fwdFromVXLAN() {
 	}
 }
 
-// tsnet logf adapter to charm
-func createLogf(logger *log.Logger, level log.Level) func(format string, args ...interface{}) {
-	return func(format string, args ...interface{}) {
-		// Format the message like Printf would
-		message := fmt.Sprintf(format, args...)
-		// Send to charm logger
-		logger.Log(level, message)
-	}
-}
-
 func resolveMagicDNS(ctx context.Context, tsServer *tsnet.Server, hostname string) (net.IP, error) {
 	localClient, err := tsServer.LocalClient()
 	if err != nil {
@@ -251,14 +243,13 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	logger = log.New(os.Stderr)
-	tsLogger := log.New(os.Stderr)
+	logger = charmlog.New(os.Stdout)
 
 	logger.Info("tsl2 started")
 
 	if len(os.Getenv("DEBUG")) > 0 {
 		logger.Info("Debug flag enabled")
-		logger.SetLevel(log.DebugLevel)
+		logger.SetLevel(charmlog.DebugLevel)
 	}
 
 	_peer := os.Getenv("PEER")
@@ -293,17 +284,36 @@ func main() {
 		Hostname:  hostname,
 		Ephemeral: isEphemeral,
 		AuthKey:   authKey,
-		UserLogf:  createLogf(tsLogger, log.InfoLevel),
-		Logf:      createLogf(tsLogger, log.DebugLevel),
+		UserLogf:  log.Printf,
+		// Logf:      log.Printf,
 	}
 	defer tsServer.Close()
-
-	// resolve peer hostname using magicDNS
-	peerIP, err := resolveMagicDNS(ctx, tsServer, _peer)
+	_, err = tsServer.Up(ctx)
 	if err != nil {
-		logger.Fatal("Failed to resolve peer via magicDNS", "peer", _peer, "error", err)
+		logger.Fatal("Failed to bring tailscale up")
 		return
 	}
+
+	// Keep trying to resolve peer until found
+	logger.Info("Waiting for peer to be available in MagicDNS", "peer", _peer)
+	var peerIP net.IP
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Fatal("Context cancelled while waiting for peer")
+			return
+		default:
+			var err error
+			peerIP, err = resolveMagicDNS(ctx, tsServer, _peer)
+			if err == nil {
+				logger.Info("Successfully resolved peer", "peer", _peer, "ip", peerIP)
+				goto peerFound
+			}
+			logger.Info("Peer not found in MagicDNS, retrying...", "peer", _peer, "error", err)
+			time.Sleep(5 * time.Second)
+		}
+	}
+peerFound:
 
 	peer = &net.UDPAddr{
 		IP:   peerIP,
@@ -313,10 +323,6 @@ func main() {
 	logger.Info("Resolved peer", "peer", _peer, "ip", peerIP, "port", vxlanPort)
 
 	tsV4Addr, _ := tsServer.TailscaleIPs()
-	if !tsV4Addr.IsValid() {
-		logger.Fatal("No valid Tailscale IPv4 address available")
-		return
-	}
 
 	tsConn, err = tsServer.ListenPacket("udp4", fmt.Sprintf("%s:%d", tsV4Addr, vxlanPort))
 	if err != nil {
