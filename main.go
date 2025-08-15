@@ -244,6 +244,12 @@ func main() {
 		logger.Error("Remote peer must be defined using 'PEER' environment variable")
 		return
 	}
+
+	peer = &net.UDPAddr{
+		IP:   net.ParseIP(_peer),
+		Port: vxlanPort,
+	}
+
 	logger.Info("Peer defined", "peer", _peer, "port", vxlanPort)
 
 	authKey := os.Getenv("AUTH_KEY")
@@ -275,17 +281,11 @@ func main() {
 	}
 	defer tsServer.Close()
 
-	// resolve magicDNS -> IPv4 addr
-	conn, err := tsServer.Dial(ctx, "udp4", fmt.Sprintf("%s:%d", _peer, vxlanPort))
-	ip := conn.RemoteAddr().(*net.UDPAddr).IP
-	conn.Close()
-
-	peer = &net.UDPAddr{
-		IP:   ip,
-		Port: vxlanPort,
-	}
-
 	tsV4Addr, _ := tsServer.TailscaleIPs()
+	if !tsV4Addr.IsValid() {
+		logger.Fatal("No valid Tailscale IPv4 address available")
+		return
+	}
 
 	tsConn, err = tsServer.ListenPacket("udp4", fmt.Sprintf("%s:%d", tsV4Addr, vxlanPort))
 	if err != nil {
