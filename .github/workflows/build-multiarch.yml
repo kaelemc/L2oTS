@@ -13,7 +13,7 @@ env:
   IMAGE: ${{ github.repository }}   # e.g. kaelemc/clab-tailscale
 
 jobs:
-  build:
+   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,32 +34,37 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build amd64, push by digest
-      - name: Build & push amd64 by digest
-        id: build_amd64
+      # Build & push single-arch images (sequential)
+      - name: Build & push amd64 (tagged)
         uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE }},push-by-digest=true
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE }}:dev-amd64
+          provenance: false
+          sbom: false
 
-      # Build arm64, push by digest
-      - name: Build & push arm64 by digest
-        id: build_arm64
+      - name: Build & push arm64 (tagged)
         uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/arm64
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE }},push-by-digest=true
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE }}:dev-arm64
+          provenance: false
+          sbom: false
 
       # Create and push the multi-arch manifest as :dev
-      - name: Create & push dev manifest
+      - name: Create & push :dev manifest
         run: |
           set -euo pipefail
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE }}"
-          AMD="${{ steps.build_amd64.outputs.digest }}"
-          ARM="${{ steps.build_arm64.outputs.digest }}"
           docker buildx imagetools create \
             -t "${IMAGE}:dev" \
-            "${IMAGE}@${AMD}" \
-            "${IMAGE}@${ARM}"
+            "${IMAGE}:dev-amd64" \
+            "${IMAGE}:dev-arm64"
+
+      # Optional: show what got published
+      - name: Inspect :dev
+        run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE }}:dev
