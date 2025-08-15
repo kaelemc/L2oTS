@@ -86,10 +86,18 @@ func (iface *IFaceL2) bindIntfToSocket() error {
 	err = unix.Bind(fd, sa)
 	if err != nil {
 		unix.Close(fd)
+		iface.socketFd = -1
 		return fmt.Errorf("failed to bind unix socket to interface %s: %v", iface.name, err)
 	}
 
 	return nil
+}
+
+func (iface *IFaceL2) closeSocket() {
+	if iface.socketFd >= 0 {
+		unix.Close(iface.socketFd)
+		iface.socketFd = -1
+	}
 }
 
 // local veth -> tailscale remote peer
@@ -101,7 +109,10 @@ func (iface *IFaceL2) fwdToVXLAN() {
 		readBuf := make([]byte, 1500)
 		n, err := unix.Read(iface.socketFd, readBuf)
 		if err != nil {
-			logger.Fatal(err)
+			logger.Error("Failed to read from socket", "interface", iface.name, "error", err)
+			break
+		}
+		if n <= 0 || n > len(readBuf) {
 			continue
 		}
 
@@ -120,14 +131,17 @@ func (iface *IFaceL2) fwdToVXLAN() {
 			ValidIDFlag: true,
 		}
 
-		err = gopacket.SerializeLayers(vxlBuf, vxlOpts, vxlan, gopacket.Payload(readBuf))
+		err = gopacket.SerializeLayers(vxlBuf, vxlOpts, vxlan, gopacket.Payload(frame))
 		if err != nil {
-			log.Fatal(err)
+			logger.Error("Failed to serialize VXLAN frame", "interface", iface.name, "error", err)
 			continue
 		}
 		logger.Debug("Serialized frame... Writing", "interface", iface.name, "bytes", len(vxlBuf.Bytes()))
 
-		tsConn.WriteTo(vxlBuf.Bytes(), peer)
+		_, err = tsConn.WriteTo(vxlBuf.Bytes(), peer)
+		if err != nil {
+			logger.Error("Failed to write to tailscale connection", "interface", iface.name, "error", err)
+		}
 	}
 }
 
@@ -140,7 +154,10 @@ func fwdFromVXLAN() {
 		readBuf := make([]byte, 1500)
 		n, _, err := tsConn.ReadFrom(readBuf)
 		if err != nil {
-			logger.Fatal(err)
+			logger.Error("Failed to read from tailscale connection", "error", err)
+			break
+		}
+		if n <= 0 || n > len(readBuf) {
 			continue
 		}
 
@@ -150,7 +167,7 @@ func fwdFromVXLAN() {
 		packet := gopacket.NewPacket(rawVXLAN, layers.LayerTypeVXLAN, gopacket.Default)
 		vxlLayer := packet.Layer(layers.LayerTypeVXLAN)
 		if vxlLayer == nil {
-			logger.Fatal(err)
+			logger.Error("No VXLAN layer found in packet")
 			continue
 		}
 
@@ -166,9 +183,14 @@ func fwdFromVXLAN() {
 		}
 
 		vni := vxlan.VNI
-		ethFrame := packet.ApplicationLayer().LayerContents()
+		appLayer := packet.ApplicationLayer()
+		if appLayer == nil {
+			logger.Error("No application layer found")
+			continue
+		}
 
-		if ethFrame == nil {
+		ethFrame := appLayer.LayerContents()
+		if ethFrame == nil || len(ethFrame) == 0 {
 			logger.Error("No L2 payload received")
 			continue
 		}
@@ -186,7 +208,10 @@ func fwdFromVXLAN() {
 			continue
 		}
 
-		unix.Write(outIf.socketFd, ethFrame)
+		_, err = unix.Write(outIf.socketFd, ethFrame)
+		if err != nil {
+			logger.Error("Failed to write frame to interface", "interface", outIf.name, "error", err)
+		}
 	}
 }
 
@@ -256,7 +281,7 @@ func main() {
 	}
 	defer tsServer.Close()
 
-	tsConn, err := tsServer.ListenPacket("udp", fmt.Sprintf("%s:%d", peer.IP.String(), peer.Port))
+	tsConn, err = tsServer.ListenPacket("udp", fmt.Sprintf("%s:%d", peer.IP.String(), peer.Port))
 	if err != nil {
 		logger.Fatal(err.Error())
 		return
@@ -296,7 +321,8 @@ func main() {
 
 		err = l2IfaceObj.bindIntfToSocket()
 		if err != nil {
-			logger.Error(err)
+			logger.Error("Failed to bind interface to socket", "interface", name, "error", err)
+			continue
 		} else {
 			logger.Info("Successfully bound interface to unix socket", "interface", name)
 		}
@@ -311,4 +337,8 @@ func main() {
 
 	<-ctx.Done()
 	logger.Info("Stopping")
+
+	for _, intf := range interfaces {
+		intf.closeSocket()
+	}
 }
