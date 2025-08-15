@@ -281,7 +281,9 @@ func main() {
 	}
 	defer tsServer.Close()
 
-	tsConn, err = tsServer.ListenPacket("udp", fmt.Sprintf("%s:%d", peer.IP.String(), peer.Port))
+	tsV4Addr, _ := tsServer.TailscaleIPs()
+
+	tsConn, err = tsServer.ListenPacket("udp", fmt.Sprintf("%s:%d", tsV4Addr, vxlanPort))
 	if err != nil {
 		logger.Fatal(err.Error())
 		return
