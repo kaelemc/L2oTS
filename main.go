@@ -190,7 +190,7 @@ func fwdFromVXLAN() {
 		}
 
 		ethFrame := appLayer.LayerContents()
-		if ethFrame == nil || len(ethFrame) == 0 {
+		if len(ethFrame) == 0 {
 			logger.Error("No L2 payload received")
 			continue
 		}
