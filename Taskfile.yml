@@ -4,7 +4,7 @@ version: '3'
 
 vars:
   REGISTRY: ghcr.io/kaelemc
-  IMAGE_NAME: ts-clab
+  IMAGE_NAME: clab-tailscale
   TAG: dev
 
 
