@@ -103,7 +103,7 @@ func (iface *IFaceL2) closeSocket() {
 // local veth -> tailscale remote peer
 func (iface *IFaceL2) fwdToVXLAN() {
 
-	logger.Info("Starting interface to VXLAN forwarder", "interface", iface.index)
+	logger.Info("Starting interface to VXLAN forwarder", "interface", iface.name, "index", iface.index)
 
 	for {
 		readBuf := make([]byte, 1500)
