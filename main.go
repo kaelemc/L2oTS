@@ -225,6 +225,28 @@ func createLogf(logger *log.Logger, level log.Level) func(format string, args ..
 	}
 }
 
+func resolveMagicDNS(ctx context.Context, tsServer *tsnet.Server, hostname string) (net.IP, error) {
+	localClient, err := tsServer.LocalClient()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get local client: %w", err)
+	}
+
+	status, err := localClient.Status(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get status: %w", err)
+	}
+
+	for _, peer := range status.Peer {
+		if peer.DNSName == hostname || peer.HostName == hostname {
+			if len(peer.TailscaleIPs) > 0 {
+				return net.ParseIP(peer.TailscaleIPs[0].String()), nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("peer %s not found in magicDNS", hostname)
+}
+
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -245,12 +267,7 @@ func main() {
 		return
 	}
 
-	peer = &net.UDPAddr{
-		IP:   net.ParseIP(_peer),
-		Port: vxlanPort,
-	}
-
-	logger.Info("Peer defined", "peer", _peer, "port", vxlanPort)
+	logger.Info("Peer hostname", "peer", _peer)
 
 	authKey := os.Getenv("AUTH_KEY")
 	if len(authKey) == 0 {
@@ -280,6 +297,20 @@ func main() {
 		Logf:      createLogf(tsLogger, log.DebugLevel),
 	}
 	defer tsServer.Close()
+
+	// resolve peer hostname using magicDNS
+	peerIP, err := resolveMagicDNS(ctx, tsServer, _peer)
+	if err != nil {
+		logger.Fatal("Failed to resolve peer via magicDNS", "peer", _peer, "error", err)
+		return
+	}
+
+	peer = &net.UDPAddr{
+		IP:   peerIP,
+		Port: vxlanPort,
+	}
+
+	logger.Info("Resolved peer", "peer", _peer, "ip", peerIP, "port", vxlanPort)
 
 	tsV4Addr, _ := tsServer.TailscaleIPs()
 	if !tsV4Addr.IsValid() {
