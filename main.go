@@ -26,7 +26,7 @@ var (
 )
 
 const (
-	intfMatchPattern = "eth%d"
+	intfMatchPattern = `eth\d+`
 	vxlanPort        = 4789
 	tsServerWorkDir  = "/var/lib/tsl2/"
 )
@@ -60,7 +60,7 @@ func parseInterfaces() ([]netlink.Link, error) {
 			continue
 		}
 
-		fmt.Printf("%s", intfName)
+		logger.Debugf("%s", intfName)
 
 		match := expr.MatchString(intfName)
 		if match {
@@ -190,11 +190,22 @@ func fwdFromVXLAN() {
 	}
 }
 
+// tsnet logf adapter to charm
+func createLogf(logger *log.Logger, level log.Level) func(format string, args ...interface{}) {
+	return func(format string, args ...interface{}) {
+		// Format the message like Printf would
+		message := fmt.Sprintf(format, args...)
+		// Send to charm logger
+		logger.Log(level, message)
+	}
+}
+
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	logger = log.New(os.Stderr)
+	tsLogger := log.New(os.Stderr)
 
 	logger.Info("tsl2 started")
 
@@ -228,9 +239,9 @@ func main() {
 	}
 	logger.Info("Got hostname", "hostname", hostname)
 
-	isEphemeral := false
-	if len(os.Getenv("EPHEMERAL")) > 0 {
-		isEphemeral = true
+	isEphemeral := true
+	if len(os.Getenv("NO_EPHEMERAL")) > 0 {
+		isEphemeral = false
 	}
 	logger.Info("Ephemeral status", "ephemeral", isEphemeral)
 
@@ -240,6 +251,8 @@ func main() {
 		Hostname:  hostname,
 		Ephemeral: isEphemeral,
 		AuthKey:   authKey,
+		UserLogf:  createLogf(tsLogger, log.InfoLevel),
+		Logf:      createLogf(tsLogger, log.DebugLevel),
 	}
 	defer tsServer.Close()
 
@@ -274,13 +287,27 @@ func main() {
 		vni := uint32(num)
 		logger.Debug("Generated VNI", "interface", name, "vni", vni)
 
-		interfaces = append(interfaces, &IFaceL2{
+		l2IfaceObj := &IFaceL2{
 			name:     name,
 			index:    intf.Attrs().Index,
 			socketFd: -1,
 			vni:      vni,
-		})
+		}
+
+		err = l2IfaceObj.bindIntfToSocket()
+		if err != nil {
+			logger.Error(err)
+		} else {
+			logger.Info("Successfully bound interface to unix socket", "interface", name)
+		}
+
+		interfaces = append(interfaces, l2IfaceObj)
 	}
+
+	for _, intf := range interfaces {
+		go intf.fwdToVXLAN()
+	}
+	go fwdFromVXLAN()
 
 	<-ctx.Done()
 	logger.Info("Stopping")
