@@ -119,10 +119,22 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create and push multi-arch manifest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          TAGS: ${{ steps.meta.outputs.tags }}   # multi-line
         run: |
           set -euo pipefail
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          for t in ${{ steps.meta.outputs.tags }}; do
-            digests=$(for d in /tmp/digests/*; do printf " %s@sha256:%s" "$IMAGE" "$(basename "$d")"; done)
-            docker buildx imagetools create -t "$t" $digests
+          # Turn multiline $TAGS into an array safely
+          readarray -t TAG_ARR <<< "$TAGS"
+
+          # Build the digest list once
+          digests=()
+          for d in /tmp/digests/*; do
+            digests+=("$IMAGE@sha256:$(basename "$d")")
           done
+
+          # Create a manifest per tag
+          for t in "${TAG_ARR[@]}"; do
+            docker buildx imagetools create -t "$t" "${digests[@]}"
+          done
+
