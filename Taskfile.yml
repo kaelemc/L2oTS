@@ -1,0 +1,14 @@
+# https://taskfile.dev
+
+version: '3'
+
+vars:
+  REGISTRY: ghcr.io/kaelemc
+  IMAGE_NAME: ts-clab
+  TAG: dev
+
+
+tasks:
+  default:
+    cmds:
+      - docker build -t {{.REGISTRY}}/{{.IMAGE_NAME}}:{{.TAG}} .
