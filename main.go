@@ -22,22 +22,21 @@ import (
 
 var (
 	logger     *charmlog.Logger
-	tsConn     net.PacketConn
-	peer       *net.UDPAddr
+	peer       net.Addr
 	interfaces []*IFaceL2
 )
 
 const (
 	intfMatchPattern = `eth\d+`
-	vxlanPort        = 4789
 	tsServerWorkDir  = "/var/lib/tsl2/"
 )
 
 type IFaceL2 struct {
-	name     string
-	index    int
-	socketFd int
-	vni      uint32
+	name      string
+	index     int
+	socketFd  int
+	circuitID uint16 // virtual circuit ID -> UDP port
+	tsConn    *net.PacketConn
 }
 
 func parseInterfaces() ([]netlink.Link, error) {
@@ -80,6 +79,17 @@ func (iface *IFaceL2) bindIntfToSocket() error {
 	}
 	iface.socketFd = fd
 
+	mreq := unix.PacketMreq{
+		Ifindex: int32(iface.index),
+		Type:    unix.PACKET_MR_PROMISC,
+	}
+
+	err = unix.SetsockoptPacketMreq(fd, unix.SOL_PACKET, unix.PACKET_ADD_MEMBERSHIP, &mreq)
+	if err != nil {
+		unix.Close(fd)
+		return fmt.Errorf("failed to set promiscuous mode for %s: %v", iface.name, err)
+	}
+
 	sa := &unix.SockaddrLinklayer{
 		Protocol: unix.ETH_P_ALL,
 		Ifindex:  iface.index,
@@ -102,89 +112,91 @@ func (iface *IFaceL2) closeSocket() {
 	}
 }
 
-// local veth -> tailscale remote peer
-func (iface *IFaceL2) fwdToVXLAN() {
-
-	logger.Info("Starting interface to VXLAN forwarder", "interface", iface.name, "index", iface.index)
+// forward a frame received on the local itf (unix socket)
+// with L2oUDP via tailscale
+func (iface *IFaceL2) l2FwdLoop() {
+	logger.Info("starting local->remote forwarder", "interface", iface.name, "id", iface.circuitID)
 
 	for {
-		readBuf := make([]byte, 1500)
-		n, err := unix.Read(iface.socketFd, readBuf)
+		buf := make([]byte, 1500)
+		n, err := unix.Read(iface.socketFd, buf)
 		if err != nil {
 			logger.Error("Failed to read from socket", "interface", iface.name, "error", err)
 			break
 		}
-		if n <= 0 || n > len(readBuf) {
+		frameLength := len(buf)
+		if n <= 0 || n > frameLength {
 			continue
 		}
 
-		frame := readBuf[:n]
+		frame := buf[:n]
 		logger.Debug("Got frame", "interface", iface.name, "bytes", len(frame))
 
-		// build the vxlan frame
-		vxlBuf := gopacket.NewSerializeBuffer()
-		vxlOpts := gopacket.SerializeOptions{
+		// build UDP header
+		sBuf := gopacket.NewSerializeBuffer()
+		sOpts := gopacket.SerializeOptions{
 			FixLengths:       true,
 			ComputeChecksums: true,
 		}
 
-		vxlan := &layers.VXLAN{
-			VNI:         iface.vni,
-			ValidIDFlag: true,
+		port := layers.UDPPort(iface.circuitID)
+
+		udp := &layers.UDP{
+			DstPort: port,
+			Length:  uint16(frameLength),
 		}
 
-		err = gopacket.SerializeLayers(vxlBuf, vxlOpts, vxlan, gopacket.Payload(frame))
+		err = gopacket.SerializeLayers(sBuf, sOpts, udp, gopacket.Payload(buf))
 		if err != nil {
 			logger.Error("Failed to serialize VXLAN frame", "interface", iface.name, "error", err)
 			continue
 		}
-		logger.Debug("Serialized frame... Writing", "interface", iface.name, "bytes", len(vxlBuf.Bytes()))
+		logger.Debug("Serialized frame... Writing", "interface", iface.name, "bytes", len(sBuf.Bytes()))
 
-		_, err = tsConn.WriteTo(vxlBuf.Bytes(), peer)
+		tsConn := *iface.tsConn
+
+		_, err = tsConn.WriteTo(sBuf.Bytes(), peer)
 		if err != nil {
 			logger.Error("Failed to write to tailscale connection", "interface", iface.name, "error", err)
 		}
+
 	}
 }
 
-// Tailscale remote peer -> local veth
-func fwdFromVXLAN() {
-
-	logger.Info("Starting VXLAN to interface forwarder")
+func (iface *IFaceL2) l2RecvLoop() {
+	logger.Info("starting remote->local forwarder", "interface", iface.name, "id", iface.circuitID)
 
 	for {
-		readBuf := make([]byte, 1500)
-		n, _, err := tsConn.ReadFrom(readBuf)
+		buf := make([]byte, 1500)
+		tsConn := *iface.tsConn
+		n, _, err := tsConn.ReadFrom(buf)
 		if err != nil {
-			logger.Error("Failed to read from tailscale connection", "error", err)
+			logger.Error("Failed to read from socket", "interface", iface.name, "error", err)
 			break
 		}
-		if n <= 0 || n > len(readBuf) {
+		frameLength := len(buf)
+		if n <= 0 || n > frameLength {
 			continue
 		}
 
-		rawVXLAN := readBuf[:n]
-		logger.Debug("Got VXLAN packet from Tailscale", "bytes", len(rawVXLAN))
+		frame := buf[:n]
+		logger.Debug("Got frame", "interface", iface.name, "bytes", len(frame))
 
-		packet := gopacket.NewPacket(rawVXLAN, layers.LayerTypeVXLAN, gopacket.Default)
-		vxlLayer := packet.Layer(layers.LayerTypeVXLAN)
-		if vxlLayer == nil {
-			logger.Error("No VXLAN layer found in packet")
-			continue
-		}
+		packet := gopacket.NewPacket(frame, layers.LayerTypeUDP, gopacket.Default)
+		udpLayer := packet.Layer(layers.LayerTypeUDP)
 
-		vxlan, ok := vxlLayer.(*layers.VXLAN)
+		udp, ok := udpLayer.(*layers.UDP)
 		if !ok {
-			logger.Error("failed to cast VXLAN layer")
+			logger.Error("failed to cast UDP layer")
 			continue
 		}
 
-		if !vxlan.ValidIDFlag {
-			logger.Error("VXLAN VNI flag not set")
+		port := udp.DstPort
+		if port != layers.UDPPort(iface.circuitID) {
+			logger.Error("Mismatch port receieved", "interface", iface.name, "recvPort", port, "wanted", iface.circuitID)
 			continue
 		}
 
-		vni := vxlan.VNI
 		appLayer := packet.ApplicationLayer()
 		if appLayer == nil {
 			logger.Error("No application layer found")
@@ -197,24 +209,12 @@ func fwdFromVXLAN() {
 			continue
 		}
 
-		var outIf *IFaceL2
-		for _, intf := range interfaces {
-			if intf.vni == vni {
-				outIf = intf
-				break
-			}
-		}
-
-		if outIf == nil {
-			logger.Error("Could not match VNI to local interface", "vni", vni)
-			continue
-		}
-
-		_, err = unix.Write(outIf.socketFd, ethFrame)
+		_, err = unix.Write(iface.socketFd, ethFrame)
 		if err != nil {
-			logger.Error("Failed to write frame to interface", "interface", outIf.name, "error", err)
+			logger.Error("Failed to write frame to interface", "interface", iface.name, "error", err)
 		}
 	}
+
 }
 
 func resolveMagicDNS(ctx context.Context, tsServer *tsnet.Server, hostname string) (net.IP, error) {
@@ -315,21 +315,13 @@ func main() {
 	}
 peerFound:
 
-	peer = &net.UDPAddr{
-		IP:   peerIP,
-		Port: vxlanPort,
+	peer = &net.IPAddr{
+		IP: peerIP,
 	}
 
-	logger.Info("Resolved peer", "peer", _peer, "ip", peerIP, "port", vxlanPort)
+	logger.Info("Resolved peer", "peer", _peer, "ip", peerIP)
 
 	tsV4Addr, _ := tsServer.TailscaleIPs()
-
-	tsConn, err = tsServer.ListenPacket("udp4", fmt.Sprintf("%s:%d", tsV4Addr, vxlanPort))
-	if err != nil {
-		logger.Fatal(err.Error())
-		return
-	}
-	defer tsConn.Close()
 
 	localInterfaces, err := parseInterfaces()
 	if err != nil {
@@ -352,14 +344,22 @@ peerFound:
 			continue
 		}
 
-		vni := uint32(num)
-		logger.Debug("Generated VNI", "interface", name, "vni", vni)
+		id := uint16(num)
+		logger.Debug("Generated virtual circuit id", "interface", name, "id", id)
+
+		tsConn, err := tsServer.ListenPacket("udp4", fmt.Sprintf("%s:%d", tsV4Addr, id))
+		if err != nil {
+			logger.Fatal(err.Error())
+			return
+		}
+		defer tsConn.Close()
 
 		l2IfaceObj := &IFaceL2{
-			name:     name,
-			index:    intf.Attrs().Index,
-			socketFd: -1,
-			vni:      vni,
+			name:      name,
+			index:     intf.Attrs().Index,
+			socketFd:  -1,
+			circuitID: id,
+			tsConn:    &tsConn,
 		}
 
 		err = l2IfaceObj.bindIntfToSocket()
@@ -374,9 +374,9 @@ peerFound:
 	}
 
 	for _, intf := range interfaces {
-		go intf.fwdToVXLAN()
+		go intf.l2FwdLoop()
+		go intf.l2RecvLoop()
 	}
-	go fwdFromVXLAN()
 
 	<-ctx.Done()
 	logger.Info("Stopping")
