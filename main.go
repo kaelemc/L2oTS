@@ -29,6 +29,7 @@ var (
 const (
 	intfMatchPattern = `eth\d+`
 	tsServerWorkDir  = "/var/lib/tsl2/"
+	mtu              = 1500
 )
 
 type IFaceL2 struct {
@@ -37,6 +38,7 @@ type IFaceL2 struct {
 	socketFd  int
 	circuitID uint16 // virtual circuit ID -> UDP port
 	tsConn    *net.PacketConn
+	done      chan struct{}
 }
 
 func parseInterfaces() ([]netlink.Link, error) {
@@ -116,16 +118,22 @@ func (iface *IFaceL2) closeSocket() {
 // with L2oUDP via tailscale
 func (iface *IFaceL2) l2FwdLoop() {
 	logger.Info("starting local->remote forwarder", "interface", iface.name, "id", iface.circuitID)
+	defer iface.closeSocket()
 
+	buf := make([]byte, mtu)
 	for {
-		buf := make([]byte, 1500)
+		select {
+		case <-iface.done:
+			return
+		default:
+		}
+
 		n, err := unix.Read(iface.socketFd, buf)
 		if err != nil {
 			logger.Error("Failed to read from socket", "interface", iface.name, "error", err)
 			break
 		}
-		frameLength := len(buf)
-		if n <= 0 || n > frameLength {
+		if n <= 0 || n > mtu {
 			continue
 		}
 
@@ -143,16 +151,20 @@ func (iface *IFaceL2) l2FwdLoop() {
 
 		udp := &layers.UDP{
 			DstPort: port,
-			Length:  uint16(frameLength),
+			Length:  uint16(n + 8), // UDP header is 8 bytes
 		}
 
-		err = gopacket.SerializeLayers(sBuf, sOpts, udp, gopacket.Payload(buf))
+		err = gopacket.SerializeLayers(sBuf, sOpts, udp, gopacket.Payload(frame))
 		if err != nil {
 			logger.Error("Failed to serialize VXLAN frame", "interface", iface.name, "error", err)
 			continue
 		}
 		logger.Debug("Serialized frame... Writing", "interface", iface.name, "bytes", len(sBuf.Bytes()))
 
+		if iface.tsConn == nil {
+			logger.Error("tsConn is nil", "interface", iface.name)
+			continue
+		}
 		tsConn := *iface.tsConn
 
 		_, err = tsConn.WriteTo(sBuf.Bytes(), peer)
@@ -165,17 +177,27 @@ func (iface *IFaceL2) l2FwdLoop() {
 
 func (iface *IFaceL2) l2RecvLoop() {
 	logger.Info("starting remote->local forwarder", "interface", iface.name, "id", iface.circuitID)
+	defer iface.closeSocket()
 
+	buf := make([]byte, mtu)
 	for {
-		buf := make([]byte, 1500)
+		select {
+		case <-iface.done:
+			return
+		default:
+		}
+
+		if iface.tsConn == nil {
+			logger.Error("tsConn is nil", "interface", iface.name)
+			return
+		}
 		tsConn := *iface.tsConn
 		n, _, err := tsConn.ReadFrom(buf)
 		if err != nil {
 			logger.Error("Failed to read from socket", "interface", iface.name, "error", err)
 			break
 		}
-		frameLength := len(buf)
-		if n <= 0 || n > frameLength {
+		if n <= 0 || n > mtu {
 			continue
 		}
 
@@ -307,13 +329,15 @@ func main() {
 			peerIP, err = resolveMagicDNS(ctx, tsServer, _peer)
 			if err == nil {
 				logger.Info("Successfully resolved peer", "peer", _peer, "ip", peerIP)
-				goto peerFound
+				break
 			}
 			logger.Info("Peer not found in MagicDNS, retrying...", "peer", _peer, "error", err)
 			time.Sleep(5 * time.Second)
 		}
+		if peerIP != nil {
+			break
+		}
 	}
-peerFound:
 
 	peer = &net.IPAddr{
 		IP: peerIP,
@@ -352,7 +376,6 @@ peerFound:
 			logger.Fatal(err.Error())
 			return
 		}
-		defer tsConn.Close()
 
 		l2IfaceObj := &IFaceL2{
 			name:      name,
@@ -360,7 +383,9 @@ peerFound:
 			socketFd:  -1,
 			circuitID: id,
 			tsConn:    &tsConn,
+			done:      make(chan struct{}),
 		}
+		defer tsConn.Close()
 
 		err = l2IfaceObj.bindIntfToSocket()
 		if err != nil {
@@ -382,6 +407,7 @@ peerFound:
 	logger.Info("Stopping")
 
 	for _, intf := range interfaces {
+		close(intf.done)
 		intf.closeSocket()
 	}
 }
