@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -74,12 +75,31 @@ func parseInterfaces() ([]netlink.Link, error) {
 	return filtered, nil
 }
 
+// helper for network order bytes
+func htons(i uint16) uint16 {
+	b := make([]byte, 2)
+	binary.LittleEndian.PutUint16(b, i)
+	return binary.BigEndian.Uint16(b)
+}
+
 func (iface *IFaceL2) bindIntfToSocket() error {
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, unix.ETH_P_ALL)
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ALL)))
 	if err != nil {
 		return fmt.Errorf("failed creating unix socket for %s: %v", iface.name, err)
 	}
 	iface.socketFd = fd
+
+	sa := &unix.SockaddrLinklayer{
+		Protocol: htons(unix.ETH_P_ALL),
+		Ifindex:  iface.index,
+	}
+
+	err = unix.Bind(fd, sa)
+	if err != nil {
+		unix.Close(fd)
+		iface.socketFd = -1
+		return fmt.Errorf("failed to bind unix socket to interface %s: %v", iface.name, err)
+	}
 
 	mreq := unix.PacketMreq{
 		Ifindex: int32(iface.index),
@@ -90,18 +110,6 @@ func (iface *IFaceL2) bindIntfToSocket() error {
 	if err != nil {
 		unix.Close(fd)
 		return fmt.Errorf("failed to set promiscuous mode for %s: %v", iface.name, err)
-	}
-
-	sa := &unix.SockaddrLinklayer{
-		Protocol: unix.ETH_P_ALL,
-		Ifindex:  iface.index,
-	}
-
-	err = unix.Bind(fd, sa)
-	if err != nil {
-		unix.Close(fd)
-		iface.socketFd = -1
-		return fmt.Errorf("failed to bind unix socket to interface %s: %v", iface.name, err)
 	}
 
 	return nil
