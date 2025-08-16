@@ -152,7 +152,7 @@ func (iface *IFaceL2) l2FwdLoop() {
 		sBuf := gopacket.NewSerializeBuffer()
 		sOpts := gopacket.SerializeOptions{
 			FixLengths:       true,
-			ComputeChecksums: true,
+			ComputeChecksums: false,
 		}
 
 		port := layers.UDPPort(iface.circuitID)
@@ -164,7 +164,7 @@ func (iface *IFaceL2) l2FwdLoop() {
 
 		err = gopacket.SerializeLayers(sBuf, sOpts, udp, gopacket.Payload(frame))
 		if err != nil {
-			logger.Error("Failed to serialize VXLAN frame", "interface", iface.name, "error", err)
+			logger.Error("Failed to serialize UDP frame", "interface", iface.name, "error", err)
 			continue
 		}
 		logger.Debug("Serialized frame... Writing", "interface", iface.name, "bytes", len(sBuf.Bytes()))
