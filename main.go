@@ -382,7 +382,7 @@ func main() {
 			continue
 		}
 
-		id := uint16(num)
+		id := uint16(5000 + int(num))
 		logger.Debug("Generated virtual circuit id", "interface", name, "id", id)
 
 		tsConn, err := tsServer.ListenPacket("udp4", fmt.Sprintf("%s:%d", tsV4Addr, id))
