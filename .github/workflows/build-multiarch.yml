@@ -10,7 +10,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE: ${{ github.repository }}   # e.g. kaelemc/clab-tailscale
+  IMAGE: kaelemc/l2ots
 
 jobs:
    build:
