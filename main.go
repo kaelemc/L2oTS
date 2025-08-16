@@ -129,6 +129,20 @@ func (iface *IFaceL2) l2FwdLoop() {
 	defer iface.closeSocket()
 
 	buf := make([]byte, mtu)
+	sBuf := gopacket.NewSerializeBuffer()
+
+	sOpts := gopacket.SerializeOptions{
+		FixLengths:       true,
+		ComputeChecksums: false,
+	}
+	udp := &layers.UDP{
+		DstPort: layers.UDPPort(iface.circuitID),
+	}
+	udpPeer := &net.UDPAddr{
+		IP:   peer.(*net.UDPAddr).IP,
+		Port: int(iface.circuitID),
+	}
+
 	for {
 		select {
 		case <-iface.done:
@@ -147,20 +161,8 @@ func (iface *IFaceL2) l2FwdLoop() {
 
 		frame := buf[:n]
 		logger.Debug("Got frame", "interface", iface.name, "bytes", len(frame))
-
-		// build UDP header
-		sBuf := gopacket.NewSerializeBuffer()
-		sOpts := gopacket.SerializeOptions{
-			FixLengths:       true,
-			ComputeChecksums: false,
-		}
-
-		port := layers.UDPPort(iface.circuitID)
-
-		udp := &layers.UDP{
-			DstPort: port,
-			Length:  uint16(n + 8), // UDP header is 8 bytes
-		}
+		sBuf.Clear()
+		udp.Length = uint16(n + 8) // UDP header is 8 bytes
 
 		err = gopacket.SerializeLayers(sBuf, sOpts, udp, gopacket.Payload(frame))
 		if err != nil {
@@ -175,11 +177,6 @@ func (iface *IFaceL2) l2FwdLoop() {
 		}
 		tsConn := *iface.tsConn
 
-		udpPeer := &net.UDPAddr{
-			IP:   peer.(*net.UDPAddr).IP,
-			Port: int(iface.circuitID),
-		}
-
 		_, err = tsConn.WriteTo(sBuf.Bytes(), udpPeer)
 		if err != nil {
 			logger.Error("Failed to write to tailscale connection", "interface", iface.name, "error", err)
@@ -193,6 +190,13 @@ func (iface *IFaceL2) l2RecvLoop() {
 	defer iface.closeSocket()
 
 	buf := make([]byte, mtu)
+	decoder := gopacket.NewDecodingLayerParser(layers.LayerTypeUDP)
+	var udp layers.UDP
+	var payload gopacket.Payload
+	decoder.AddDecodingLayer(&udp)
+	decoder.AddDecodingLayer(&payload)
+	decoded := make([]gopacket.LayerType, 0, 10)
+
 	for {
 		select {
 		case <-iface.done:
@@ -217,32 +221,37 @@ func (iface *IFaceL2) l2RecvLoop() {
 		frame := buf[:n]
 		logger.Debug("Got frame", "interface", iface.name, "bytes", len(frame))
 
-		packet := gopacket.NewPacket(frame, layers.LayerTypeUDP, gopacket.Default)
-		udpLayer := packet.Layer(layers.LayerTypeUDP)
-
-		udp, ok := udpLayer.(*layers.UDP)
-		if !ok {
-			logger.Error("failed to cast UDP layer")
+		// clean
+		decoded = decoded[:0]
+		err = decoder.DecodeLayers(frame, &decoded)
+		if err != nil {
+			logger.Error("Failed to decode packet", "interface", iface.name, "error", err)
 			continue
 		}
 
-		port := udp.DstPort
-		if port != layers.UDPPort(iface.circuitID) {
-			logger.Error("Mismatch port receieved", "interface", iface.name, "recvPort", port, "wanted", iface.circuitID)
+		hasUDP := false
+		for _, layerType := range decoded {
+			if layerType == layers.LayerTypeUDP {
+				hasUDP = true
+				break
+			}
+		}
+		if !hasUDP {
+			logger.Error("No UDP layer found")
 			continue
 		}
 
-		appLayer := packet.ApplicationLayer()
-		if appLayer == nil {
-			logger.Error("No application layer found")
+		if udp.DstPort != layers.UDPPort(iface.circuitID) {
+			logger.Error("Mismatch port received", "interface", iface.name, "recvPort", udp.DstPort, "wanted", iface.circuitID)
 			continue
 		}
 
-		ethFrame := appLayer.LayerContents()
-		if len(ethFrame) == 0 {
+		if len(payload) == 0 {
 			logger.Error("No L2 payload received")
 			continue
 		}
+
+		ethFrame := []byte(payload)
 
 		_, err = unix.Write(iface.socketFd, ethFrame)
 		if err != nil {
