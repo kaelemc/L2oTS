@@ -175,7 +175,12 @@ func (iface *IFaceL2) l2FwdLoop() {
 		}
 		tsConn := *iface.tsConn
 
-		_, err = tsConn.WriteTo(sBuf.Bytes(), peer)
+		udpPeer := &net.UDPAddr{
+			IP:   peer.(*net.UDPAddr).IP,
+			Port: int(iface.circuitID),
+		}
+
+		_, err = tsConn.WriteTo(sBuf.Bytes(), udpPeer)
 		if err != nil {
 			logger.Error("Failed to write to tailscale connection", "interface", iface.name, "error", err)
 		}
@@ -347,8 +352,9 @@ func main() {
 		}
 	}
 
-	peer = &net.IPAddr{
-		IP: peerIP,
+	peer = &net.UDPAddr{
+		IP:   peerIP,
+		Port: 0, // Will be set per-interface
 	}
 
 	logger.Info("Resolved peer", "peer", _peer, "ip", peerIP)
